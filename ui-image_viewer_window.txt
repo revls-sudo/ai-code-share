@@ -1,0 +1,45 @@
+import customtkinter as ctk
+from PIL import Image
+
+class ImageViewerWindow(ctk.CTkToplevel):
+    def __init__(self, master, app_instance, image_path, title="Item Image"):
+        super().__init__(master)
+        self.app = app_instance
+        self.title(title)
+        self.transient(master)
+        self.grab_set()
+        self.grid_columnconfigure(0, weight=1)
+
+        try:
+            pil_image = Image.open(image_path)
+            max_size = (800, 800)
+            pil_image.thumbnail(max_size, Image.Resampling.LANCZOS)
+            ctk_image = ctk.CTkImage(pil_image, size=pil_image.size)
+            
+            image_label = ctk.CTkLabel(self, image=ctk_image, text="")
+            image_label.grid(row=0, column=0, padx=10, pady=10)
+            
+            # --- Add a "Close" button ---
+            destructive_fg, destructive_hover, destructive_text, _ = self.app.get_button_color_config("destructive")
+            close_button = ctk.CTkButton(
+                self, text="Close", command=self.destroy,
+                fg_color=destructive_fg, hover_color=destructive_hover, text_color=destructive_text
+            )
+            close_button.grid(row=1, column=0, pady=(0, 10))
+
+            # --- Manual window centering ---
+            self.update_idletasks()
+            win_width = pil_image.width + 20
+            win_height = pil_image.height + 20 + 50
+            screen_width = self.winfo_screenwidth()
+            screen_height = self.winfo_screenheight()
+            x = (screen_width // 2) - (win_width // 2)
+            y = (screen_height // 2) - (win_height // 2)
+            self.geometry(f"{win_width}x{win_height}+{x}+{y}")
+
+        except Exception as e:
+            self.title("Error")
+            error_label = ctk.CTkLabel(self, text=f"Could not load image.\nError: {e}", padx=40, pady=40)
+            error_label.pack()
+
+        self.bind("<Escape>", lambda event: self.destroy())

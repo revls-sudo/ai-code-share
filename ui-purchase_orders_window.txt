@@ -1,0 +1,261 @@
+import customtkinter as ctk
+from tkinter import ttk, messagebox
+from utils import center_and_size_toplevel
+import datetime
+
+class PurchaseOrdersWindow(ctk.CTkToplevel):
+    def __init__(self, master, app_instance, summary_data):
+        super().__init__(master)
+        self.app = app_instance
+        self.summary_data = summary_data
+        self._last_sort_column = None
+        self._last_sort_reverse = False
+        
+        self.title("Open Purchase Orders")
+        self.transient(master)
+        self.grab_set()
+
+        self.summary_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.detail_frame = ctk.CTkFrame(self, fg_color="transparent")
+
+        self._setup_summary_view()
+        self._setup_detail_view()
+
+        self.show_summary_view()
+        center_and_size_toplevel(self, base_width=1100, base_height=600)
+        self.bind("<Escape>", self.on_escape)
+
+        self.after(50, self.load_data_async)
+
+    def _format_date(self, date_str):
+        if not date_str or '0001-01-01' in date_str: return ""
+        try:
+            return datetime.datetime.fromisoformat(date_str).strftime('%d/%m/%Y')
+        except (ValueError, TypeError):
+            return date_str
+
+    def _setup_summary_view(self):
+        self.summary_frame.grid_rowconfigure(0, weight=1); self.summary_frame.grid_columnconfigure(0, weight=1)
+        tree_frame = ctk.CTkFrame(self.summary_frame); tree_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        tree_frame.grid_rowconfigure(0, weight=1); tree_frame.grid_columnconfigure(0, weight=1)
+
+        style = ttk.Style()
+        style.map('Treeview', background=[('selected', '#A9CCE3')], foreground=[('selected', 'black')])
+        heading_font = self.app.get_treeview_font_tuple(base_size=12, weight="bold")
+        tree_font = self.app.get_treeview_font_tuple(base_size=11)
+        style.configure("Treeview.Heading", font=heading_font); style.configure("Treeview", rowheight=int(28 * self.app.scaling_factor), font=tree_font)
+
+        self.summary_tree = ttk.Treeview(tree_frame, style="Treeview", show='headings', selectmode='browse')
+        
+        # --- Combined column for dates ---
+        self.summary_columns = {
+            'documentNo': 'PO Number', 
+            'brand': 'Brand', 
+            'quantity': 'Total Qty', 
+            'ksshipmenttype': 'Shipment Type', 
+            'deliveryOrEta': 'Delivery / ETA' # Combined date column
+        }
+        self.summary_tree['columns'] = list(self.summary_columns.keys())
+
+        for col_id, text in self.summary_columns.items():
+            self.summary_tree.heading(col_id, text=text, command=lambda c=col_id: self.sort_summary_column(c))
+            self.summary_tree.column(col_id, width=180, anchor='e' if col_id == 'quantity' else 'w')
+        
+        self.summary_tree.grid(row=0, column=0, sticky="nsew")
+        
+        # --- Colour scheme ---
+        self.summary_tree.tag_configure('overdue', background='#FADBD8')    # Light Red for past dates
+        self.summary_tree.tag_configure('this_week', background='#D5F5E3')    # Light Green for this week
+        self.summary_tree.tag_configure('next_week', background='#FCF3CF')    # Light Yellow for next week
+
+        # --- Corrected Button Layout ---
+        button_frame = ctk.CTkFrame(self.summary_frame, fg_color="transparent")
+        button_frame.grid(row=1, column=0, pady=(0,10), padx=10, sticky="ew")
+        button_frame.grid_columnconfigure(0, weight=1)
+
+        destructive_fg, destructive_hover, destructive_text, _ = self.app.get_button_color_config("destructive")
+        positive_fg, positive_hover, positive_text, _ = self.app.get_button_color_config("positive")
+
+        ctk.CTkButton(button_frame, text="Back", command=self.destroy,
+                      fg_color=destructive_fg, hover_color=destructive_hover, text_color=destructive_text
+                     ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkButton(button_frame, text="View Details", command=self.show_selected_detail_view,
+                      fg_color=positive_fg, hover_color=positive_hover, text_color=positive_text
+                     ).grid(row=0, column=1, sticky="e")
+
+    def _setup_detail_view(self):
+        self.detail_frame.grid_rowconfigure(1, weight=1); self.detail_frame.grid_columnconfigure(0, weight=1)
+        self.detail_title_label = ctk.CTkLabel(self.detail_frame, text="", font=ctk.CTkFont(size=16, weight="bold"))
+        self.detail_title_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        
+        tree_frame = ctk.CTkFrame(self.detail_frame); tree_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        tree_frame.grid_rowconfigure(0, weight=1); tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.detail_tree = ttk.Treeview(tree_frame, style="Treeview", show='headings')
+        columns = {
+            'Productcode': {'text': 'SKU', 'width': 120}, 
+            'description': {'text': 'Description', 'width': 350}, 
+            'soh': {'text': 'SoH', 'width': 80, 'anchor': 'e'}, 
+            'quantity': {'text': 'Ordered Qty', 'width': 100, 'anchor': 'e'}
+        }
+
+        self.detail_tree['columns'] = list(columns.keys())
+        for col_id, config in columns.items():
+            self.detail_tree.heading(col_id, text=config['text'])
+            self.detail_tree.column(col_id, width=config['width'], anchor=config.get('anchor', 'w'))
+        
+        self.detail_tree.grid(row=0, column=0, sticky="nsew")
+
+        button_frame = ctk.CTkFrame(self.detail_frame, fg_color="transparent")
+        button_frame.grid(row=2, column=0, pady=(0,10), padx=10, sticky="w")
+        ctk.CTkButton(button_frame, text="< Back to Summary", command=self.show_summary_view).pack()
+
+    def show_summary_view(self):
+        self.detail_frame.pack_forget(); self.summary_frame.pack(fill="both", expand=True)
+        self.title("Open Purchase Orders")
+
+    def show_selected_detail_view(self):
+        selected = self.summary_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select a PO/Brand row to view its details.", parent=self)
+            return
+        
+        summary_index = self.summary_tree.index(selected[0])
+        selected_summary_object = self.summary_data[summary_index]
+        self.show_detail_view(selected_summary_object)
+
+    def show_detail_view(self, selected_summary_object):
+        self.summary_frame.pack_forget(); self.detail_frame.pack(fill="both", expand=True)
+        
+        po_num = selected_summary_object['documentNo']
+        brand = selected_summary_object['brand']
+        self.title(f"Details for PO: {po_num} ({brand})")
+        self.detail_title_label.configure(text=f"Details for PO: {po_num} ({brand})")
+
+        for item in self.detail_tree.get_children(): self.detail_tree.delete(item)
+            
+        line_items = selected_summary_object['line_items']
+        for item in sorted(line_items, key=lambda x: x.get('Productcode', '')):
+            values = [item.get(col_id, '') for col_id in self.detail_tree['columns']]
+            self.detail_tree.insert('', 'end', values=tuple(values))
+
+    def get_sort_key(self, item):
+        """Default sort: By Delivery Date first, then by ETA Date."""
+        def safe_date(date_str):
+            if not date_str or '0001-01-01' in date_str:
+                return datetime.date(9999, 12, 31) # Far-future date sorts last
+            try:
+                return datetime.datetime.fromisoformat(date_str).date()
+            except:
+                return datetime.date(9999, 12, 31)
+
+        delivery_date = safe_date(item.get('ksdeliverydate'))
+        landing_date = safe_date(item.get('kslandingdate'))
+        
+        return (delivery_date, landing_date, item.get('documentNo', ''))
+        def safe_date(date_str):
+            if not date_str or '0001-01-01' in date_str: return datetime.date(9999, 12, 31)
+            try: return datetime.datetime.fromisoformat(date_str).date()
+            except: return datetime.date(9999, 12, 31)
+
+        delivery_date = safe_date(item.get('ksdeliverydate'))
+        landing_date = safe_date(item.get('kslandingdate'))
+        primary_sort_date = delivery_date if delivery_date != datetime.date(9999, 12, 31) else landing_date
+        return (primary_sort_date, item.get('documentNo', ''))
+
+    def populate_summary_tree(self):
+        """Populates the tree, applying new highlighting and creating the combined date column."""
+        for item in self.summary_tree.get_children(): self.summary_tree.delete(item)
+
+        today = datetime.date.today()
+        start_of_this_week = today - datetime.timedelta(days=today.weekday())
+        end_of_this_week = start_of_this_week + datetime.timedelta(days=6)
+        
+        start_of_next_week = end_of_this_week + datetime.timedelta(days=1)
+        end_of_next_week = start_of_next_week + datetime.timedelta(days=6)
+
+        for i, summary in enumerate(self.summary_data):
+            delivery_date_str = summary.get('ksdeliverydate')
+            landing_date_str = summary.get('kslandingdate')
+            tag = ''
+            
+            if delivery_date_str and '0001-01-01' not in delivery_date_str:
+                try:
+                    delivery_date = datetime.datetime.fromisoformat(delivery_date_str).date()
+                    if delivery_date < start_of_this_week: tag = 'overdue'
+                    elif start_of_this_week <= delivery_date <= end_of_this_week: tag = 'this_week'
+                    elif start_of_next_week <= delivery_date <= end_of_next_week: tag = 'next_week'
+                except (ValueError, TypeError): pass
+            
+            delivery_display = self._format_date(delivery_date_str)
+            eta_display = self._format_date(landing_date_str)
+
+            if delivery_display:
+                delivery_or_eta_text = delivery_display
+            else:
+                delivery_or_eta_text = f"ETA: {eta_display}" if eta_display else ""
+
+            values = (
+                summary.get('documentNo', ''),
+                summary.get('brand', ''),
+                summary.get('quantity', 0),
+                summary.get('ksshipmenttype', ''),
+                delivery_or_eta_text
+            )
+            
+            self.summary_tree.insert('', 'end', values=values, iid=i, tags=(tag,))
+
+    def sort_summary_column(self, col_id):
+        """Sorts the data by the selected column and repopulates the tree."""
+        reverse = self._last_sort_column == col_id and not self._last_sort_reverse
+        
+        def get_col_key(item):
+            if col_id == 'deliveryOrEta':
+                return self.get_sort_key(item)
+            
+            val = item.get(col_id)
+            if val is None: return ""
+            return str(val).lower()
+
+        self.summary_data.sort(key=get_col_key, reverse=reverse)
+        
+        self._last_sort_column = col_id
+        self._last_sort_reverse = reverse
+        self.populate_summary_tree()
+        reverse = self._last_sort_column == col_id and not self._last_sort_reverse
+        
+        def get_col_key(item):
+            val = item.get(col_id)
+            if 'date' in col_id.lower():
+                if not val or '0001-01-01' in val: return datetime.date(9999, 12, 31)
+                try: return datetime.datetime.fromisoformat(val).date()
+                except: return datetime.date(9999, 12, 31)
+            if val is None: return ""
+            return val
+
+        self.summary_data.sort(key=get_col_key, reverse=reverse)
+        
+        self._last_sort_column = col_id
+        self._last_sort_reverse = reverse
+        self.populate_summary_tree()
+
+    def load_data_async(self):
+        loading_item = self.summary_tree.insert('', 'end', values=('Loading... Please wait...',))
+        self.update_idletasks() # Ensure "Loading" message appears
+        
+        self.summary_data = self.app.fetch_and_process_open_pos() or []
+        
+        self.summary_tree.delete(loading_item)
+        
+        if not self.summary_data:
+            messagebox.showinfo("Purchase Orders", "No open purchase orders found.", parent=self)
+            self.destroy()
+            return
+
+        self.summary_data.sort(key=self.get_sort_key)
+        self.populate_summary_tree()
+
+    def on_escape(self, event=None):
+        if self.detail_frame.winfo_ismapped(): self.show_summary_view()
+        else: self.destroy()

@@ -1,0 +1,178 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import ttk, messagebox
+from utils import center_and_size_toplevel
+
+class AdvancedSearchWindow(ctk.CTkToplevel):
+    def __init__(self, master, app_instance):
+        super().__init__(master)
+        self.app = app_instance
+        self.last_search_results = []
+        self.filter_job = None # For debouncing
+
+        self.title("Advanced Stock Search")
+        self.transient(master)
+        self.grab_set()
+
+        self.grid_rowconfigure(1, weight=1); self.grid_columnconfigure(0, weight=1)
+
+        # --- Search Input Frame (Live Search) ---
+        search_input_frame = ctk.CTkFrame(self, fg_color="transparent")
+        search_input_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        search_input_frame.grid_columnconfigure(0, weight=1)
+
+        self.search_entry = ctk.CTkEntry(
+            search_input_frame,
+            height=35, font=ctk.CTkFont(size=14),
+            placeholder_text="Live search by SKU, Description, Brand, Notes, or 'is:tag'..."
+        )
+        self.search_entry.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        # Bind to key release to trigger the live search
+        self.search_entry.bind("<KeyRelease>", self.on_filter_change)
+
+        # --- Treeview Results Frame ---
+        tree_frame = ctk.CTkFrame(self)
+        tree_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+        tree_frame.grid_rowconfigure(0, weight=1); tree_frame.grid_columnconfigure(0, weight=1)
+
+        style = ttk.Style()
+        style.map('Treeview', background=[('selected', '#A9CCE3')], foreground=[('selected', 'black')])
+        heading_font = self.app.get_treeview_font_tuple(base_size=12, weight="bold")
+        tree_font = self.app.get_treeview_font_tuple(base_size=11)
+        style.configure("Treeview.Heading", font=heading_font)
+        style.configure("Treeview", rowheight=int(28 * self.app.scaling_factor), font=tree_font)
+        
+        self.results_tree = ttk.Treeview(tree_frame, style="Treeview", show='headings', selectmode='browse')
+        
+        self.columns = ('sku', 'description', 'brand', 'barcode', 'locationname', 'notes') 
+        self.results_tree['columns'] = self.columns
+        
+        self.results_tree.heading('sku', text='SKU')
+        self.results_tree.heading('description', text='Description')
+        self.results_tree.heading('brand', text='Brand')
+        self.results_tree.heading('barcode', text='Barcode')
+        self.results_tree.heading('locationname', text='Location')
+        self.results_tree.heading('notes', text='Notes')
+
+        self.results_tree.column('#0', width=0, stretch=tk.NO)
+        self.results_tree.column('sku', width=100)
+        self.results_tree.column('description', width=300, stretch=tk.YES)
+        self.results_tree.column('brand', width=120)
+        self.results_tree.column('barcode', width=120)
+        self.results_tree.column('locationname', width=120, anchor='center')
+        self.results_tree.column('notes', width=200, stretch=tk.YES)
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.results_tree.yview)
+        vsb.grid(row=0, column=1, sticky='ns')
+        self.results_tree.configure(yscrollcommand=vsb.set); self.results_tree.grid(row=0, column=0, sticky='nsew')
+        
+        self.results_tree.bind('<<TreeviewSelect>>', self.on_result_select)
+        self.results_tree.bind('<Double-1>', self.view_selected_sku_details)
+
+        # --- Results Count & Action Buttons ---
+        bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
+        bottom_frame.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
+        bottom_frame.grid_columnconfigure(0, weight=1)
+        
+        self.results_count_label = ctk.CTkLabel(bottom_frame, text="Results: 0", font=ctk.CTkFont(size=14))
+        self.results_count_label.grid(row=0, column=0, padx=5, sticky="w")
+
+        self.go_to_bin_button = ctk.CTkButton(bottom_frame, text="Go To Bin", command=self.go_to_selected_bin, state="disabled")
+        self.go_to_bin_button.grid(row=0, column=1, padx=5, sticky="e")
+        
+        self.view_details_button = ctk.CTkButton(bottom_frame, text="View SKU Details", command=self.view_selected_sku_details, state="disabled")
+        self.view_details_button.grid(row=0, column=2, padx=5, sticky="e")
+        
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.on_result_select()
+        self.search_entry.focus_set()
+        center_and_size_toplevel(self, base_width=1000, base_height=600)
+
+    def on_filter_change(self, event=None):
+        """Debouncing logic for the live search."""
+        if self.filter_job:
+            self.after_cancel(self.filter_job)
+        self.filter_job = self.after(500, self.execute_search)
+
+    def execute_search(self):
+        """Executes the search and populates the tree."""
+        search_term = self.search_entry.get().strip()
+        if not search_term:
+            for i in self.results_tree.get_children(): self.results_tree.delete(i)
+            self.results_count_label.configure(text="Results: 0")
+            return
+
+        self.results_count_label.configure(text="Searching...")
+        self.update_idletasks()
+
+        self.last_search_results = self.app.perform_advanced_lsi_search(search_term)
+        self.populate_results_tree(self.last_search_results) 
+
+    def populate_results_tree(self, results):
+        for i in self.results_tree.get_children(): self.results_tree.delete(i)
+        
+        count = 0
+        if results:
+            for item_data in results:
+                unique_row_id = f"I{count}"
+
+                values_tuple = (
+                    item_data.get('SKU', ''),
+                    item_data.get('Description', ''),
+                    item_data.get('Brand', ''),
+                    item_data.get('Barcode', ''),
+                    item_data.get('LocationName', 'None'),
+                    item_data.get('Notes', '')
+                )
+                self.results_tree.insert('', tk.END, values=values_tuple, iid=unique_row_id)
+                count += 1
+    
+        self.results_count_label.configure(text=f"Results: {count}")   
+        self.on_result_select()
+        
+        children = self.results_tree.get_children()
+        if children:
+            self.results_tree.focus(children[0]); self.results_tree.selection_set(children[0])
+
+    def on_result_select(self, event=None):
+        is_selected = bool(self.results_tree.selection())
+        self.view_details_button.configure(state="normal" if is_selected else "disabled")
+        self.go_to_bin_button.configure(state="normal" if is_selected else "disabled")
+
+    def go_to_selected_bin(self):
+        selected_iids = self.results_tree.selection()
+        if not selected_iids: return
+        
+        try:
+            selected_index = self.results_tree.index(selected_iids[0])
+            selected_item_data = self.last_search_results[selected_index]
+            location_name = selected_item_data.get('LocationName')
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Could not find data for the selected row.", parent=self)
+            return
+
+        if location_name == 'None':
+            messagebox.showinfo("No Location", "This item exists in LSI but has no bulk locations.", parent=self)
+            return
+        
+        self.app.navigate_to_location_results(location_name)
+        self.destroy()
+
+    def view_selected_sku_details(self, event=None):
+        """Navigates to the SKU results screen for the selected item."""
+        selected_iids = self.results_tree.selection()
+        if not selected_iids:
+            return
+
+        try:
+            selected_index = self.results_tree.index(selected_iids[0])
+            selected_item_data = self.last_search_results[selected_index]
+            sku_to_view = selected_item_data.get('SKU')
+
+            if sku_to_view:
+                self.app.navigate_to_sku_results(sku_to_view)
+                self.destroy()
+            else:
+                messagebox.showerror("Error", "Could not determine SKU for the selected row.", parent=self)
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Could not find data for the selected row.", parent=self)

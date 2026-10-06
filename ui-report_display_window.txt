@@ -1,0 +1,270 @@
+import customtkinter as ctk
+import tkinter as tk
+import datetime
+from tkinter import ttk, filedialog, messagebox
+import csv
+from tkinter import font as tkfont
+
+class ReportDisplayWindow(ctk.CTkToplevel):
+    def __init__(self, master, title, columns_config, data_rows, app_instance=None):
+        """
+        A generic window to display report data in a Treeview.
+        Args:
+            master: The parent window.
+            title (str): The title of the report window.
+            columns_config (list of dicts): Configuration for Treeview columns.
+                Each dict: {'id': 'col_id', 'text': 'Heading Text', 'width': 100, 'anchor': 'w'}
+            data_rows (list of dicts): Data to populate the tree. Keys should match col_id.
+            app_instance: Optional reference to the main App instance.
+        """
+        super().__init__(master)
+        self.app = app_instance
+        self.data_rows = data_rows
+        self.columns_config = columns_config
+
+        # --- Define fonts and common properties ---
+        self.button_font = ctk.CTkFont(size=14, weight="bold")
+        self.button_height = 35
+        self.tree_font_family = "Segoi UI"
+        self.tree_font_size = 11
+
+        self.title(title)
+        self.transient(master)
+        self.grab_set() 
+
+        # --- Configure main grid ---
+        self.grid_rowconfigure(0, weight=1) 
+        self.grid_columnconfigure(0, weight=1) 
+
+        # --- Treeview Frame ---
+        tree_frame = ctk.CTkFrame(self)
+        tree_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        # --- Treeview styling ---
+        style = ttk.Style()
+        style.map('Treeview', background=[('selected', '#A9CCE3')], foreground=[('selected', 'black')])
+        heading_font = self.app.get_treeview_font_tuple(base_size=12, weight="bold")
+        tree_font = self.app.get_treeview_font_tuple(base_size=11)
+
+        # Configure the style
+        style.configure("Treeview.Heading", font=heading_font)
+        style.configure("Treeview", rowheight=int(28 * self.app.scaling_factor), font=tree_font)
+        self.tree = ttk.Treeview(tree_frame, style="Treeview", show='headings', selectmode='browse')
+        
+        col_ids = [c['id'] for c in columns_config]
+        self.tree['columns'] = tuple(col_ids)
+
+        for col_conf in columns_config:
+            self.tree.heading(col_conf['id'], text=col_conf['text'])
+            self.tree.column(
+                col_conf['id'], 
+                anchor=col_conf.get('anchor', tk.W),
+                stretch=tk.NO
+            )
+        self.tree.column('#0', width=0, stretch=tk.NO)
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        hsb.grid(row=1, column=0, sticky='ew')
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+
+        self.populate_tree(col_ids, data_rows)
+
+        # --- Auto-resize columns and window ---
+        self.auto_resize_columns_and_window()
+
+        # --- Close Button / Bottom Frame ---
+        bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
+        bottom_frame.grid(row=1, column=0, pady=(5,10), padx=10, sticky="ew")
+        
+        # Configure grid to have a left-aligned label and a right-aligned button
+        bottom_frame.grid_columnconfigure(0, weight=1) # Column for the label (expands)
+        bottom_frame.grid_columnconfigure(1, weight=0) # Column for the button (fixed size)
+        bottom_frame.grid_columnconfigure(2, weight=0) # Column for the button (fixed size)
+
+
+        # --- Results Count Label ---
+        count = len(data_rows)
+        report_specific_text = "spaces" if "Empty Locations" in title else "records"
+        self.count_label = ctk.CTkLabel(bottom_frame, text=f"Found: {count} {report_specific_text}", font=self.button_font)
+        self.count_label.grid(row=0, column=0, sticky="w", padx=(10,0))
+
+        # --- Export to CSV Button ---
+        positive_fg, positive_hover, positive_text, positive_dtext = self.app.get_button_color_config("positive")
+        csv_btn = ctk.CTkButton(bottom_frame, text="Export to CSV", command=self.export_to_csv, width=120,
+                      font=self.button_font, height=self.button_height, 
+                      fg_color=positive_fg, hover_color=positive_hover, text_color=positive_text, text_color_disabled=positive_dtext, 
+                      border_color="black", border_width=1)
+        csv_btn.grid(row=0, column=1, sticky="ew", padx=5)
+
+        # --- Close Button ---
+        destructive_fg, destructive_hover, destructive_text, destructive_dtext = self.app.get_button_color_config("destructive")
+        close_btn = ctk.CTkButton(bottom_frame, text="Close", command=self.destroy, width=100, 
+                                  font=self.button_font, height=self.button_height, 
+                                  fg_color=destructive_fg, hover_color=destructive_hover, text_color=destructive_text, text_color_disabled=destructive_dtext, 
+                                  border_color="black", border_width=1)
+        close_btn.grid(row=0, column=2, sticky="e", padx=(0,10))
+
+        self.tree.bind("<ButtonPress-1>", self._on_button_press) 
+        self.tree.bind("<B1-Motion>", self._on_mouse_drag)
+        self.tree.bind("<Control-a>", self.select_all)
+        self.tree.bind("<Control-c>", self.copy_selection) 
+
+        self.bind("<Escape>", lambda event: self.destroy())
+        self.lift()
+        self.focus_set()
+
+    def populate_tree(self, column_ids, data_rows):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        
+        if data_rows:
+            for row_data_dict in data_rows:
+                values_list = []
+                for col_id in column_ids:
+                    raw_value = row_data_dict.get(col_id)
+
+                    # If the value is a datetime object, format it nicely.
+                    if isinstance(raw_value, datetime.datetime):
+                        formatted_value = raw_value.strftime('%d/%m/%Y %H:%M')
+                        values_list.append(formatted_value)
+                    # Also handle date-only objects, just in case.
+                    elif isinstance(raw_value, datetime.date):
+                        formatted_value = raw_value.strftime('%d/%m/%Y')
+                        values_list.append(formatted_value)
+                    # If the value is None (NULL from DB), show an empty string.
+                    elif raw_value is None:
+                        values_list.append('')
+                    # For all other data types, just convert to a string.
+                    else:
+                        values_list.append(str(raw_value))
+                
+                self.tree.insert('', tk.END, values=tuple(values_list))
+
+    def export_to_csv(self):
+        if not self.data_rows:
+            messagebox.showwarning("Export Error", "There is no data to export.", parent=self)
+            return
+        
+        # Ask user for save location
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Save Report As"
+        )
+        if not file_path:
+            return # User cancelled
+
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                # Get headers from the columns_config
+                headers = [col['text'] for col in self.columns_config]
+                col_ids = [col['id'] for col in self.columns_config]
+
+                writer = csv.writer(csvfile)
+                writer.writerow(headers) # Write header row
+                
+                # Write data rows
+                for row_data in self.data_rows:
+                    writer.writerow([row_data.get(col_id, '') for col_id in col_ids])
+            
+            messagebox.showinfo("Export Successful", f"Report successfully saved to:\n{file_path}", parent=self)
+        except IOError as e:
+            messagebox.showerror("Export Error", f"Could not save the file.\nError: {e}", parent=self)
+
+    def _on_button_press(self, event):
+        """Records the starting Y position of a mouse drag."""
+        self._scroll_start_y = event.y
+
+    def _on_mouse_drag(self, event):
+        """Handles scrolling the treeview when the mouse is dragged."""
+        if hasattr(self, '_scroll_start_y'):
+            delta = self._scroll_start_y - event.y
+            self.tree.yview_scroll(int(delta / 20), "units")
+            self._scroll_start_y = event.y
+
+    def select_all(self, event=None):
+        """Selects all items in the treeview."""
+        all_items = self.tree.get_children()
+        self.tree.selection_set(all_items)
+        return "break" # Prevents the event from propagating further
+
+    def copy_selection(self, event=None):
+        """Copies the selected rows to the clipboard in a tab-separated format for Excel."""
+        selected_items = self.tree.selection()
+        if not selected_items:
+            return "break"
+
+        clipboard_text = []
+        
+        # 1. Get header text from the treeview's column configuration
+        headers = [self.tree.heading(col)["text"] for col in self.columns]
+        clipboard_text.append("\t".join(headers))
+
+        # 2. Get data from each selected row
+        for item_id in selected_items:
+            values = self.tree.item(item_id, 'values')
+            clipboard_text.append("\t".join(map(str, values)))
+        
+        final_text = "\n".join(clipboard_text)
+
+        # 3. Put the formatted text onto the system clipboard
+        self.clipboard_clear()
+        self.clipboard_append(final_text)
+
+        return "break"
+
+    def auto_resize_columns_and_window(self):
+        """Measures content and resizes Treeview columns and the window to fit."""
+        # Use tkfont for accurate measurement
+        heading_font = tkfont.Font(font=self.app.get_treeview_font(size=self.tree_font_size + 1, weight="bold"))
+        content_font = tkfont.Font(font=self.app.get_treeview_font(size=self.tree_font_size))
+
+        total_width = 0
+        for col_id in self.tree['columns']:
+            # Start with heading width
+            max_width = heading_font.measure(self.tree.heading(col_id)['text'])
+
+            # Check content width
+            for item_id in self.tree.get_children():
+                try:
+                    cell_value = self.tree.item(item_id, 'values')[self.tree['columns'].index(col_id)]
+                    cell_width = content_font.measure(str(cell_value))
+                    if cell_width > max_width:
+                        max_width = cell_width
+                except (IndexError, ValueError):
+                    continue # Skip if value is not present
+
+            # Apply padding and set column width
+            padded_width = max_width + 25 # Added a bit more padding
+            self.tree.column(col_id, width=padded_width)
+            total_width += padded_width
+        
+        # --- Resize the window ---
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+
+        # Add padding for scrollbar and window borders
+        final_width = total_width + 60
+        final_width = min(final_width, int(screen_width * 0.9)) # Don't exceed 90% of screen width
+
+        # Calculate height based on rows
+        num_rows = len(self.tree.get_children())
+        row_height = int(self.tree_font_size * 2.2)
+        header_height = 30
+        bottom_ui_height = 80 # Account for button and padding
+
+        final_height = (num_rows * row_height) + header_height + bottom_ui_height
+        final_height = min(final_height, int(screen_height * 0.85)) # Don't exceed 85% of screen height
+        final_height = max(final_height, 300) # Minimum height
+
+        # Center the window with the new dimensions
+        self.update_idletasks()
+        x = (screen_width // 2) - (final_width // 2)
+        y = (screen_height // 2) - (final_height // 2)
+        
+        self.geometry(f"{final_width}x{final_height}+{x}+{y}")
