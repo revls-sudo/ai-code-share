@@ -1,0 +1,1151 @@
+import os
+import sys
+import csv
+import queue
+import threading
+import datetime
+from urllib.parse import quote
+from tkinter import ttk, messagebox, filedialog
+import customtkinter as ctk
+import requests
+
+# =====================================================================
+# Configuration
+# =====================================================================
+BC_CONFIG = {
+    "tenant_id": os.getenv("BC_TENANT_ID", "x"),
+    "client_id": os.getenv("BC_CLIENT_ID", "x"),
+    "client_secret": os.getenv("BC_CLIENT_SECRET", "x"),
+    "company_id": os.getenv("BC_COMPANY_ID", "x"),
+    "base_url": "https://api.businesscentral.dynamics.com/v2.0/{tenantId}/Production/api/keysun/ksreports/v2.0/companies({companyId})"
+}
+
+# --- Appearance & Theme ---
+ctk.set_appearance_mode("System")  # "System", "Dark", "Light"
+ctk.set_default_color_theme("blue")
+
+
+# =====================================================================
+# Business Central Data Service
+# =====================================================================
+class BCService:
+    @staticmethod
+    def get_access_token():
+        """Acquires OAuth2 Bearer token from Azure AD using client credentials."""
+        token_url = f"https://login.microsoftonline.com/{BC_CONFIG['tenant_id']}/oauth2/v2.0/token"
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": BC_CONFIG["client_id"],
+            "client_secret": BC_CONFIG["client_secret"],
+            "scope": "https://api.businesscentral.dynamics.com/.default"
+        }
+        try:
+            resp = requests.post(token_url, data=payload, timeout=12)
+            resp.raise_for_status()
+            return resp.json().get("access_token")
+        except Exception as e:
+            raise RuntimeError(f"Authentication Failed: {e}")
+
+    @classmethod
+    def fetch_and_process_open_pos(cls, progress_callback=None):
+        """
+        Fetches open PO lines (outstandingQuantity > 0) and enriches them with SKU details.
+        Calls progress_callback(message) at each milestone.
+        """
+        if progress_callback:
+            progress_callback("Authenticating with Business Central...")
+        token = cls.get_access_token()
+        if not token:
+            raise RuntimeError("Could not retrieve authorization token.")
+
+        base_url = BC_CONFIG["base_url"].format(
+            tenantId=BC_CONFIG["tenant_id"],
+            companyId=BC_CONFIG["company_id"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 1. Fetch raw open PO lines
+        if progress_callback:
+            progress_callback("Fetching open PO lines...")
+        po_filter = "outstandingQuantity gt 0"
+        po_endpoint = f"{base_url}/ph_purchase_order?$filter={quote(po_filter)}"
+        
+        response = requests.get(po_endpoint, headers=headers, timeout=20)
+        response.raise_for_status()
+        raw_po_lines = response.json().get("value", [])
+
+        if not raw_po_lines:
+            return []
+
+        # 2. Extract unique SKUs
+        unique_skus = list(set(line.get("Productcode") for line in raw_po_lines if line.get("Productcode")))
+        sku_details_map = {}
+        batch_size = 40
+        total_batches = (len(unique_skus) + batch_size - 1) // batch_size
+
+        # 3. Batch fetch SKU metadata (Brand, SOH, Description)
+        for idx, i in enumerate(range(0, len(unique_skus), batch_size), start=1):
+            if progress_callback:
+                progress_callback(f"Fetching SKU stock info (Batch {idx}/{total_batches})...")
+            
+            batch_skus = unique_skus[i:i + batch_size]
+            sku_filter_part = " or ".join([f"productcode eq '{sku}'" for sku in batch_skus])
+            full_sku_filter = f"locationCode eq 'WH001' and ({sku_filter_part})"
+            sku_endpoint = f"{base_url}/ph_sku?$filter={quote(full_sku_filter)}"
+
+            sku_resp = requests.get(sku_endpoint, headers=headers, timeout=20)
+            sku_resp.raise_for_status()
+            sku_data = sku_resp.json().get("value", [])
+
+            for item in sku_data:
+                sku = item.get("productcode")
+                if sku:
+                    raw_brand = item.get("brand", "")
+                    cleaned_brand = raw_brand.split('_', 1)[-1] if '_' in raw_brand else raw_brand
+                    sku_details_map[sku] = {
+                        'brand': cleaned_brand or "Unknown",
+                        'description': item.get("description", ""),
+                        'soh': item.get("Quantity", 0) or 0
+                    }
+
+        # 4. Group by (PO Number, Brand)
+        if progress_callback:
+            progress_callback("Aggregating purchase order lines...")
+
+        po_brand_groups = {}
+        for line in raw_po_lines:
+            sku = line.get("Productcode")
+            sku_details = sku_details_map.get(sku, {'brand': 'Unknown', 'description': '', 'soh': 0})
+            brand = sku_details.get('brand', 'Unknown')
+            doc_no = line.get('documentNo', 'UNKNOWN')
+            group_key = (doc_no, brand)
+
+            if group_key not in po_brand_groups:
+                po_brand_groups[group_key] = {
+                    'documentNo': doc_no,
+                    'brand': brand,
+                    'quantity': 0,
+                    'ksshipmenttype': line.get('ksshipmenttype', '') or 'Standard',
+                    'kslandingdate': line.get('kslandingdate'),
+                    'ksdeliverydate': line.get('ksdeliverydate'),
+                    'line_items': []
+                }
+
+            po_brand_groups[group_key]['quantity'] += line.get('quantity', 0)
+            line_item = line.copy()
+            line_item.update(sku_details)
+            po_brand_groups[group_key]['line_items'].append(line_item)
+
+        return list(po_brand_groups.values())
+
+
+# =====================================================================
+# Main Application GUI
+# =====================================================================
+class PurchaseOrdersApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Business Central — Purchase Orders & Inbound OOS Tracker")
+
+        # --- Clean White Canvas & Geometry ---
+        ctk.set_appearance_mode("Light")
+        self.configure(fg_color="#FFFFFF")
+        self.geometry("1200x740")
+        self.minsize(1000, 600)
+
+        self.all_summary_data = []      # List of PO summary objects
+        self.all_oos_items = []          # Extrapolated list of lines with SOH < 50
+        self.filtered_po_data = []       # Currently displayed POs
+        self.filtered_oos_data = []      # Currently displayed OOS lines
+        self.current_detail_object = None
+        self.active_tab = "po"           # "po" or "oos"
+
+        # Sorting state trackers
+        self._sort_state = {"po": (None, False), "oos": (None, False), "detail": (None, False)}
+        self._msg_queue = queue.Queue()
+        self.show_components = True  # Toggle state for -8 / -9 SKUs
+
+        self._setup_styles()
+        self._build_header()
+        self._build_kpi_banner()
+        self._build_tab_switcher()
+
+        # Swappable View Containers
+        self.content_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.content_container.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        self.content_container.grid_rowconfigure(0, weight=1)
+        self.content_container.grid_columnconfigure(0, weight=1)
+
+        self.po_summary_frame = ctk.CTkFrame(self.content_container, fg_color="transparent")
+        self.oos_items_frame = ctk.CTkFrame(self.content_container, fg_color="transparent")
+        self.detail_frame = ctk.CTkFrame(self.content_container, fg_color="transparent")
+
+        self._setup_po_summary_view()
+        self._setup_oos_items_view()
+        self._setup_detail_view()
+        self._build_footer_status_bar()
+
+        # Show PO Summary by default
+        self.show_po_summary_view()
+        self.bind("<Escape>", self._on_escape)
+        self.bind("<F5>", lambda e: self.start_async_data_load())
+
+        # Start background load
+        self.after(200, self.start_async_data_load)
+        self._poll_queue()
+
+    # ---------------- UI & Styling ----------------
+    def _setup_styles(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        # --- Modern Flat Minimalist Scrollbars ---
+        for orient in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(
+                orient,
+                gripcount=0,
+                background="#CBD5E1",        # Modern light-slate thumb
+                darkcolor="#CBD5E1",
+                lightcolor="#CBD5E1",
+                troughcolor="#F8FAFC",       # Seamless near-white track
+                bordercolor="#F8FAFC",
+                arrowcolor="#64748B",        # Sleek slate arrows
+                arrowsize=11,
+                relief="flat",
+                borderwidth=0
+            )
+            style.map(
+                orient,
+                background=[("active", "#94A3B8"), ("pressed", "#64748B")],
+                arrowcolor=[("active", "#1E293B")]
+            )
+
+        # --- Treeview Header & Body Styling ---
+        style.configure(
+            "Treeview.Heading",
+            font=("Segoe UI", 10, "bold"),
+            background="#2B3E50",
+            foreground="white",
+            relief="flat",
+            padding=6
+        )
+        style.map("Treeview.Heading", background=[("active", "#34495E")])
+
+        style.configure(
+            "Treeview",
+            rowheight=30,
+            font=("Segoe UI", 10),
+            background="#FFFFFF",
+            fieldbackground="#FFFFFF",
+            borderwidth=0
+        )
+        style.map('Treeview', background=[('selected', '#3498DB')], foreground=[('selected', 'white')])
+
+    def _build_header(self):
+        header_bar = ctk.CTkFrame(self, fg_color="transparent")
+        header_bar.pack(fill="x", padx=16, pady=(12, 6))
+
+        title_lbl = ctk.CTkLabel(
+            header_bar,
+            text="Purchase Orders & Inbound Stock Dashboard",
+            font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold")
+        )
+        title_lbl.pack(side="left")
+
+        self.btn_refresh = ctk.CTkButton(
+            header_bar,
+            text="⟳ Refresh (F5)",
+            width=110,
+            command=self.start_async_data_load
+        )
+        self.btn_refresh.pack(side="right", padx=(8, 0))
+
+        self.btn_export = ctk.CTkButton(
+            header_bar,
+            text="⬇ Export CSV",
+            width=110,
+            fg_color="#27AE60",
+            hover_color="#219150",
+            command=self.export_to_csv
+        )
+        self.btn_export.pack(side="right")
+
+    def _build_kpi_banner(self):
+        self.kpi_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.kpi_frame.pack(fill="x", padx=16, pady=(0, 8))
+
+        # Solid color palette
+        self.card_total_pos = self._create_kpi_card(self.kpi_frame, "Total Open POs", "0", "#1B6CA8")
+        self.card_total_qty = self._create_kpi_card(self.kpi_frame, "Units on Order", "0", "#7D3C98")
+        self.card_oos_count = self._create_kpi_card(self.kpi_frame, "Inbound OOS", "0", "#C0392B")
+        self.card_low_stock = self._create_kpi_card(self.kpi_frame, "Low Stock", "0", "#D35400")
+        self.card_overdue   = self._create_kpi_card(self.kpi_frame, "Overdue / This Week", "0", "#27AE60")
+
+        self.card_total_pos.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        self.card_total_qty.pack(side="left", fill="both", expand=True, padx=4)
+        self.card_oos_count.pack(side="left", fill="both", expand=True, padx=4)
+        self.card_low_stock.pack(side="left", fill="both", expand=True, padx=4)
+        self.card_overdue.pack(side="left", fill="both", expand=True, padx=(4, 0))
+
+    def _create_kpi_card(self, parent, title, value, bg_color):
+        card = ctk.CTkFrame(parent, corner_radius=18, fg_color=bg_color)
+        lbl_title = ctk.CTkLabel(
+            card, text=title.upper(),
+            font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"),
+            text_color="#E2E8F0"  # Soft white
+        )
+        lbl_title.pack(anchor="w", padx=14, pady=(8, 0))
+        lbl_val = ctk.CTkLabel(
+            card, text=value,
+            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+            text_color="#FFFFFF"  # Bold pure white
+        )
+        lbl_val.pack(anchor="w", padx=14, pady=(0, 8))
+        card.value_label = lbl_val
+        return card
+
+    def _build_tab_switcher(self):
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=16, pady=(0, 6))
+
+        self.tab_selector = ctk.CTkSegmentedButton(
+            bar,
+            values=["📦 Open Purchase Orders", "⚠️ Inbound Out of Stock / Low Stock"],
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=34,
+            corner_radius=17,
+            selected_color="#1B6CA8",
+            selected_hover_color="#144E78",
+            unselected_color="#F1F5F9",
+            unselected_hover_color="#E2E8F0",
+            command=self._on_tab_switched
+        )
+        self.tab_selector.set("📦 Open Purchase Orders")
+        self.tab_selector.pack(side="left")
+        self._refresh_segmented_styles(self.tab_selector)
+
+    def _on_tab_switched(self, selected_tab):
+        self._refresh_segmented_styles(self.tab_selector)
+        if "Out of Stock" in selected_tab:
+            self.show_oos_items_view()
+        else:
+            self.show_po_summary_view()
+
+    # ---------------- 1. PO Summary View (With Deep Search) ----------------
+    def _setup_po_summary_view(self):
+        self.po_summary_frame.grid_rowconfigure(1, weight=1)
+        self.po_summary_frame.grid_columnconfigure(0, weight=1)
+
+        filter_bar = ctk.CTkFrame(self.po_summary_frame, fg_color="transparent")
+        filter_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        self.po_search_entry = ctk.CTkEntry(
+            filter_bar,
+            placeholder_text="🔍 Search PO #, Brand, SKU, or Description...",
+            width=300,
+            height=34,
+            corner_radius=17,
+            fg_color="#FFFFFF",
+            border_color="#CBD5E1"
+        )
+        self.po_search_entry.pack(side="left", padx=(0, 8))
+        self.po_search_entry.bind("<KeyRelease>", lambda e: self.apply_po_filters())
+
+        # Date Type Pill Dropdown
+        self.date_type_var = ctk.StringVar(value="All Dates")
+        self.date_type_dropdown = ctk.CTkOptionMenu(
+            filter_bar,
+            values=["All Dates", "Confirmed Delivery", "ETA Only"],
+            variable=self.date_type_var,
+            width=135,
+            height=34,
+            corner_radius=17,
+            fg_color="#E2E8F0",
+            button_color="#CBD5E1",
+            button_hover_color="#94A3B8",
+            text_color="#0F172A",
+            command=lambda _: self.apply_po_filters()
+        )
+        self.date_type_dropdown.pack(side="left", padx=(0, 8))
+
+        # Status Pill Dropdown
+        self.status_filter_var = ctk.StringVar(value="All Statuses")
+        self.status_dropdown = ctk.CTkOptionMenu(
+            filter_bar,
+            values=["All Statuses", "Overdue", "Due This Week", "Due Next Week", "Future / No Date"],
+            variable=self.status_filter_var,
+            width=135,
+            height=34,
+            corner_radius=17,
+            fg_color="#E2E8F0",
+            button_color="#CBD5E1",
+            button_hover_color="#94A3B8",
+            text_color="#0F172A",
+            command=lambda _: self.apply_po_filters()
+        )
+        self.status_dropdown.pack(side="left", padx=(0, 8))
+
+        # Legend
+        legend_frame = ctk.CTkFrame(filter_bar, fg_color="transparent")
+        legend_frame.pack(side="right")
+        self._add_legend_item(legend_frame, "#FADBD8", "Overdue")
+        self._add_legend_item(legend_frame, "#D5F5E3", "This Week")
+        self._add_legend_item(legend_frame, "#FCF3CF", "Next Week")
+
+        # Table
+        tree_container = ctk.CTkFrame(self.po_summary_frame, fg_color="#FFFFFF")
+        tree_container.grid(row=1, column=0, sticky="nsew")
+        tree_container.grid_rowconfigure(0, weight=1)
+        tree_container.grid_columnconfigure(0, weight=1)
+
+        # Proportional column widths
+        self.po_columns = {
+            'documentNo': ('PO Number', 110, 'w'),
+            'brand': ('Brand', 150, 'w'),
+            'quantity': ('Total Units', 90, 'e'),
+            'ksshipmenttype': ('Shipment Type', 110, 'w'),
+            'deliveryOrEta': ('Delivery Date / ETA', 135, 'w'),
+            'matched_skus': ('SKUs on PO (Search Match)', 200, 'w')
+        }
+
+        self.po_tree = ttk.Treeview(
+            tree_container,
+            columns=list(self.po_columns.keys()),
+            show='headings',
+            selectmode='browse'
+        )
+
+        for col_id, (heading, width, anchor) in self.po_columns.items():
+            self.po_tree.heading(col_id, text=heading, command=lambda c=col_id: self.sort_po_column(c))
+            self.po_tree.column(col_id, width=width, anchor=anchor)
+
+        y_scroll = ttk.Scrollbar(tree_container, orient="vertical", command=self.po_tree.yview)
+        x_scroll = ttk.Scrollbar(tree_container, orient="horizontal", command=self.po_tree.xview)
+        self.po_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        self.po_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+
+        self.po_tree.tag_configure('overdue', background='#FADBD8', foreground='#78281F')
+        self.po_tree.tag_configure('this_week', background='#D5F5E3', foreground='#145A32')
+        self.po_tree.tag_configure('next_week', background='#FCF3CF', foreground='#7D6608')
+
+        self.po_tree.bind("<Double-1>", lambda e: self.show_selected_detail_view())
+        self.po_tree.bind("<Return>", lambda e: self.show_selected_detail_view())
+
+        # Bottom Button Bar
+        btn_bar = ctk.CTkFrame(self.po_summary_frame, fg_color="transparent")
+        btn_bar.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+
+        ctk.CTkButton(
+            btn_bar,
+            text="View PO Details ➔",
+            height=34,
+            corner_radius=17,
+            font=ctk.CTkFont(weight="bold"),
+            command=self.show_selected_detail_view
+        ).pack(side="right")
+
+    # ---------------- 2. Inbound OOS / Low Stock View ----------------
+    def _setup_oos_items_view(self):
+        self.oos_items_frame.grid_rowconfigure(1, weight=1)
+        self.oos_items_frame.grid_columnconfigure(0, weight=1)
+
+        # 1-Row Compact Filter Bar (Equalizes table height with PO tab)
+        filter_bar = ctk.CTkFrame(self.oos_items_frame, fg_color="transparent")
+        filter_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        self.oos_search_entry = ctk.CTkEntry(
+            filter_bar,
+            placeholder_text="🔍 Filter SKU, Description, Brand, PO#...",
+            width=280,
+            height=34,
+            corner_radius=17,
+            fg_color="#FFFFFF",
+            border_color="#CBD5E1"
+        )
+        self.oos_search_entry.pack(side="left", padx=(0, 8))
+        self.oos_search_entry.bind("<KeyRelease>", lambda e: self.apply_oos_filters())
+
+        self.oos_filter_var = ctk.StringVar(value="All Low/OOS")
+        self.oos_filter_segmented = ctk.CTkSegmentedButton(
+            filter_bar,
+            values=["All Low/OOS", "Out of Stock", "Low Stock"],
+            variable=self.oos_filter_var,
+            height=34,
+            corner_radius=17,
+            selected_color="#1B6CA8",
+            selected_hover_color="#144E78",
+            unselected_color="#F1F5F9",
+            unselected_hover_color="#E2E8F0",
+            command=lambda _: self._on_oos_segment_changed()
+        )
+        self.oos_filter_segmented.pack(side="left", padx=(0, 8))
+        self._refresh_segmented_styles(self.oos_filter_segmented)
+
+        self.oos_filter_segmented.pack(side="left", padx=(0, 8))
+
+        self.btn_components_toggle = ctk.CTkButton(
+            filter_bar,
+            text="Components: Visible",
+            height=34,
+            corner_radius=17,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#27AE60",
+            hover_color="#1E8449",
+            text_color="#FFFFFF",
+            command=self.toggle_components_visibility
+        )
+        self.btn_components_toggle.pack(side="left")
+
+        # Table Container
+        tree_container = ctk.CTkFrame(self.oos_items_frame, fg_color="#FFFFFF")
+        tree_container.grid(row=1, column=0, sticky="nsew")
+        tree_container.grid_rowconfigure(0, weight=1)
+        tree_container.grid_columnconfigure(0, weight=1)
+
+        # Compact Column Widths to prevent window clipping
+        self.oos_columns = {
+            'Productcode': ('SKU', 110, 'w'),
+            'description': ('Item Description', 250, 'w'),
+            'brand': ('Brand', 130, 'w'),
+            'soh': ('SOH', 65, 'e'),
+            'quantity': ('Incoming', 75, 'e'),
+            'documentNo': ('PO Number', 105, 'w'),
+            'deliveryOrEta': ('Delivery / ETA', 125, 'w'),
+            'stock_status': ('Stock Urgency', 135, 'w')
+        }
+
+        self.oos_tree = ttk.Treeview(
+            tree_container,
+            columns=list(self.oos_columns.keys()),
+            show='headings',
+            selectmode='browse'
+        )
+
+        for col_id, (heading, width, anchor) in self.oos_columns.items():
+            self.oos_tree.heading(col_id, text=heading, command=lambda c=col_id: self.sort_oos_column(c))
+            self.oos_tree.column(col_id, width=width, anchor=anchor)
+
+        y_scroll = ttk.Scrollbar(tree_container, orient="vertical", command=self.oos_tree.yview)
+        x_scroll = ttk.Scrollbar(tree_container, orient="horizontal", command=self.oos_tree.xview)
+        self.oos_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        self.oos_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+
+        self.oos_tree.tag_configure('oos_zero', background='#FADBD8', foreground='#78281F')
+        self.oos_tree.tag_configure('low_stock', background='#FCF3CF', foreground='#7D6608')
+
+        self.oos_tree.bind("<Double-1>", lambda e: self.show_selected_detail_view())
+        self.oos_tree.bind("<Return>", lambda e: self.show_selected_detail_view())
+
+        # Bottom Button Bar
+        btn_bar = ctk.CTkFrame(self.oos_items_frame, fg_color="transparent")
+        btn_bar.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+
+        ctk.CTkButton(
+            btn_bar,
+            text="View PO Details ➔",
+            height=34,
+            corner_radius=17,
+            font=ctk.CTkFont(weight="bold"),
+            command=self.show_selected_detail_view
+        ).pack(side="right")
+
+    # ---------------- 3. Detail View (Line Items) ----------------
+    def _setup_detail_view(self):
+        self.detail_frame.grid_rowconfigure(1, weight=1)
+        self.detail_frame.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(self.detail_frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        self.back_btn = ctk.CTkButton(
+            header,
+            text="← Back to List",
+            width=130,
+            command=self._on_back_pressed
+        )
+        self.back_btn.pack(side="left")
+
+        self.detail_title_label = ctk.CTkLabel(
+            header,
+            text="",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
+        self.detail_title_label.pack(side="left", padx=20)
+
+        tree_container = ctk.CTkFrame(self.detail_frame)
+        tree_container.grid(row=1, column=0, sticky="nsew")
+        tree_container.grid_rowconfigure(0, weight=1)
+        tree_container.grid_columnconfigure(0, weight=1)
+
+        self.detail_columns = {
+            'Productcode': ('SKU', 140, 'w'),
+            'description': ('Item Description', 440, 'w'),
+            'soh': ('Stock on Hand (WH001)', 160, 'e'),
+            'quantity': ('Ordered Qty', 130, 'e')
+        }
+
+        self.detail_tree = ttk.Treeview(
+            tree_container,
+            columns=list(self.detail_columns.keys()),
+            show='headings'
+        )
+
+        for col_id, (heading, width, anchor) in self.detail_columns.items():
+            self.detail_tree.heading(col_id, text=heading)
+            self.detail_tree.column(col_id, width=width, anchor=anchor)
+
+        y_scroll = ttk.Scrollbar(tree_container, orient="vertical", command=self.detail_tree.yview)
+        x_scroll = ttk.Scrollbar(tree_container, orient="horizontal", command=self.detail_tree.xview)
+        self.detail_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        self.detail_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+
+        # Tags for detail view
+        self.detail_tree.tag_configure('oos_zero', background='#FADBD8', foreground='#78281F')
+        self.detail_tree.tag_configure('low_stock', background='#FCF3CF', foreground='#7D6608')
+
+        self.detail_footer_lbl = ctk.CTkLabel(self.detail_frame, text="", font=ctk.CTkFont(size=12))
+        self.detail_footer_lbl.grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+    def _build_footer_status_bar(self):
+        footer = ctk.CTkFrame(self, height=26, fg_color="transparent")
+        footer.pack(fill="x", side="bottom", padx=16, pady=(4, 6))
+
+        self.status_label = ctk.CTkLabel(footer, text="Ready", font=ctk.CTkFont(size=11), text_color="gray")
+        self.status_label.pack(side="left")
+
+        self.row_count_label = ctk.CTkLabel(footer, text="", font=ctk.CTkFont(size=11), text_color="gray")
+        self.row_count_label.pack(side="right")
+
+    def _add_legend_item(self, parent, bg_color, label_text):
+        box = ctk.CTkLabel(parent, text="  ", fg_color=bg_color, width=14, height=14, corner_radius=3)
+        box.pack(side="left", padx=(8, 4))
+        lbl = ctk.CTkLabel(parent, text=label_text, font=ctk.CTkFont(size=11))
+        lbl.pack(side="left", padx=(0, 6))
+
+    # ---------------- Asynchronous Data Fetching ----------------
+    def start_async_data_load(self):
+        self.btn_refresh.configure(state="disabled")
+        self.status_label.configure(text="Connecting to Business Central...")
+
+        for item in self.po_tree.get_children():
+            self.po_tree.delete(item)
+        self.po_tree.insert('', 'end', values=('Loading data, please wait...', '', '', '', '', ''))
+
+        threading.Thread(target=self._worker_fetch_data, daemon=True).start()
+
+    def _worker_fetch_data(self):
+        def progress_handler(msg):
+            self._msg_queue.put(("status", msg))
+
+        try:
+            data = BCService.fetch_and_process_open_pos(progress_callback=progress_handler)
+            self._msg_queue.put(("data", data))
+        except Exception as e:
+            self._msg_queue.put(("error", str(e)))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg_type, payload = self._msg_queue.get_nowait()
+                if msg_type == "status":
+                    self.status_label.configure(text=payload)
+                elif msg_type == "data":
+                    self._process_loaded_data(payload)
+                    self.status_label.configure(text=f"Last updated: {datetime.datetime.now().strftime('%H:%M:%S')}")
+                    self.btn_refresh.configure(state="normal")
+                elif msg_type == "error":
+                    self.btn_refresh.configure(state="normal")
+                    self.status_label.configure(text="Failed to load data.")
+                    messagebox.showerror("Error Fetching Data", payload, parent=self)
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._poll_queue)
+
+    def _process_loaded_data(self, summary_list):
+        self.all_summary_data = summary_list or []
+        self.all_oos_items = []
+
+        total_orders_qty = 0
+        oos_zero_count = 0
+        low_stock_count = 0
+        overdue_or_this_week = 0
+
+        today = datetime.date.today()
+        start_of_week = today - datetime.timedelta(days=today.weekday())
+        end_of_week = start_of_week + datetime.timedelta(days=6)
+
+        for po in self.all_summary_data:
+            total_orders_qty += po.get('quantity', 0)
+            po['_parent_po'] = po
+
+            # Formatted combined date
+            del_str = self._format_date(po.get('ksdeliverydate'))
+            eta_str = self._format_date(po.get('kslandingdate'))
+            po['deliveryOrEta'] = del_str if del_str else (f"ETA: {eta_str}" if eta_str else "—")
+            po['matched_skus'] = ""
+
+            # Check Overdue / This week timeline
+            d_raw = po.get('ksdeliverydate')
+            if d_raw and '0001-01-01' not in str(d_raw):
+                try:
+                    dt = datetime.datetime.fromisoformat(str(d_raw)).date()
+                    if dt <= end_of_week:
+                        overdue_or_this_week += 1
+                except Exception:
+                    pass
+
+            # Extrapolate Inbound OOS / Low Stock items strictly from open PO lines
+            for line in po.get('line_items', []):
+                soh = line.get('soh', 0)
+                if soh < 50:
+                    oos_entry = dict(line)
+                    oos_entry['_parent_po'] = po
+                    oos_entry['documentNo'] = po.get('documentNo')
+                    oos_entry['brand'] = line.get('brand') or po.get('brand')
+                    oos_entry['deliveryOrEta'] = po['deliveryOrEta']
+
+                    if soh <= 0:
+                        oos_entry['stock_status'] = "🔴 OUT OF STOCK (0)"
+                        oos_zero_count += 1
+                    else:
+                        oos_entry['stock_status'] = f"🟡 LOW STOCK ({soh})"
+                        low_stock_count += 1
+
+                    self.all_oos_items.append(oos_entry)
+
+        # Update KPI Cards
+        self.card_total_pos.value_label.configure(text=f"{len(self.all_summary_data):,}")
+        self.card_total_qty.value_label.configure(text=f"{total_orders_qty:,}")
+        self.card_oos_count.value_label.configure(text=f"{oos_zero_count:,}")
+        self.card_low_stock.value_label.configure(text=f"{low_stock_count:,}")
+        self.card_overdue.value_label.configure(text=f"{overdue_or_this_week:,}")
+
+        # Default sort
+        self.all_summary_data.sort(key=self._get_default_sort_key)
+        self.apply_po_filters()
+        self.apply_oos_filters()
+
+    # ---------------- Filtering Logic ----------------
+    def apply_po_filters(self):
+        query = self.po_search_entry.get().strip().lower()
+        status_filter = self.status_filter_var.get()
+        date_type_filter = self.date_type_var.get()
+
+        self.filtered_po_data = []
+        for item in self.all_summary_data:
+            doc_no = str(item.get('documentNo', '')).lower()
+            brand = str(item.get('brand', '')).lower()
+            ship_type = str(item.get('ksshipmenttype', '')).lower()
+            date_str = str(item.get('deliveryOrEta', '')).lower()
+
+            # Deep Search: Check summary fields OR individual line items
+            matched_summary = (query in doc_no or query in brand or query in ship_type or query in date_str)
+            matching_line_skus = []
+            if query:
+                for line in item.get('line_items', []):
+                    sku = str(line.get('Productcode', '')).lower()
+                    desc = str(line.get('description', '')).lower()
+                    if query in sku or query in desc:
+                        matching_line_skus.append(line.get('Productcode', ''))
+
+            if query and not (matched_summary or matching_line_skus):
+                continue
+
+            # Confirmed vs ETA filter
+            del_raw = item.get('ksdeliverydate')
+            eta_raw = item.get('kslandingdate')
+            has_confirmed = bool(del_raw and '0001-01-01' not in str(del_raw))
+            has_eta = bool(eta_raw and '0001-01-01' not in str(eta_raw))
+
+            if date_type_filter == "Confirmed Delivery" and not has_confirmed:
+                continue
+            elif date_type_filter == "ETA Only" and (has_confirmed or not has_eta):
+                continue
+
+            # Date status timeline filter
+            cat = self._get_status_category(item)
+            if status_filter == "Overdue" and cat != "overdue":
+                continue
+            elif status_filter == "Due This Week" and cat != "this_week":
+                continue
+            elif status_filter == "Due Next Week" and cat != "next_week":
+                continue
+            elif status_filter == "Future / No Date" and cat != "future":
+                continue
+
+            display_item = dict(item)
+            display_item['matched_skus'] = ", ".join(matching_line_skus[:4]) if matching_line_skus else ""
+            self.filtered_po_data.append(display_item)
+
+        self.populate_po_tree()
+
+    def apply_oos_filters(self):
+        query = self.oos_search_entry.get().strip().lower()
+        sub_filter = self.oos_filter_var.get()
+
+        self.filtered_oos_data = []
+        for line in self.all_oos_items:
+            sku = str(line.get('Productcode', '')).strip()
+
+            # 1. Independent Components Check (Hides xxx-8xxx and xxx-9xxx)
+            if not self.show_components and '-' in sku:
+                after_dash = sku.split('-', 1)[-1]
+                if after_dash.startswith(('8', '9')):
+                    continue
+
+            # 2. Text Search Check
+            desc = str(line.get('description', '')).lower()
+            brand = str(line.get('brand', '')).lower()
+            doc_no = str(line.get('documentNo', '')).lower()
+
+            if query and not (query in sku.lower() or query in desc or query in brand or query in doc_no):
+                continue
+
+            # 3. Stock Level Check
+            soh = line.get('soh', 0)
+            if sub_filter == "Out of Stock" and soh > 0:
+                continue
+            elif sub_filter == "Low Stock" and (soh <= 0 or soh >= 50):
+                continue
+
+            self.filtered_oos_data.append(line)
+
+        self.populate_oos_tree()
+
+        self.populate_oos_tree()
+
+    def populate_po_tree(self):
+        for item in self.po_tree.get_children():
+            self.po_tree.delete(item)
+
+        for i, summary in enumerate(self.filtered_po_data):
+            cat = self._get_status_category(summary)
+            tag = cat if cat in ['overdue', 'this_week', 'next_week'] else ''
+
+            values = (
+                summary.get('documentNo', ''),
+                summary.get('brand', ''),
+                f"{summary.get('quantity', 0):,}",
+                summary.get('ksshipmenttype', ''),
+                summary.get('deliveryOrEta', '—'),
+                summary.get('matched_skus', '')
+            )
+            self.po_tree.insert('', 'end', iid=str(i), values=values, tags=(tag,) if tag else ())
+
+        if self.active_tab == "po":
+            self.row_count_label.configure(text=f"Showing {len(self.filtered_po_data)} of {len(self.all_summary_data)} Purchase Orders")
+
+    def populate_oos_tree(self):
+        for item in self.oos_tree.get_children():
+            self.oos_tree.delete(item)
+
+        for i, line in enumerate(self.filtered_oos_data):
+            soh = line.get('soh', 0)
+            tag = 'oos_zero' if soh <= 0 else 'low_stock'
+
+            values = (
+                line.get('Productcode', ''),
+                line.get('description', ''),
+                line.get('brand', ''),
+                f"{soh:,}",
+                f"{line.get('quantity', 0):,}",
+                line.get('documentNo', ''),
+                line.get('deliveryOrEta', '—'),
+                line.get('stock_status', '')
+            )
+            self.oos_tree.insert('', 'end', iid=str(i), values=values, tags=(tag,))
+
+        if self.active_tab == "oos":
+            self.row_count_label.configure(text=f"Showing {len(self.filtered_oos_data)} of {len(self.all_oos_items)} Critical Inbound Items")
+
+    # ---------------- Helpers & Sorting ----------------
+    def _format_date(self, date_str):
+        if not date_str or '0001-01-01' in str(date_str):
+            return ""
+        try:
+            return datetime.datetime.fromisoformat(str(date_str)).strftime('%d/%m/%Y')
+        except (ValueError, TypeError):
+            return str(date_str)
+
+    def _get_status_category(self, item):
+        delivery_str = item.get('ksdeliverydate')
+        if not delivery_str or '0001-01-01' in delivery_str:
+            return 'future'
+        try:
+            delivery_date = datetime.datetime.fromisoformat(delivery_str).date()
+            today = datetime.date.today()
+            start_of_this_week = today - datetime.timedelta(days=today.weekday())
+            end_of_this_week = start_of_this_week + datetime.timedelta(days=6)
+            start_of_next_week = end_of_this_week + datetime.timedelta(days=1)
+            end_of_next_week = start_of_next_week + datetime.timedelta(days=6)
+
+            if delivery_date < start_of_this_week:
+                return 'overdue'
+            elif start_of_this_week <= delivery_date <= end_of_this_week:
+                return 'this_week'
+            elif start_of_next_week <= delivery_date <= end_of_next_week:
+                return 'next_week'
+            return 'future'
+        except Exception:
+            return 'future'
+
+    def _get_default_sort_key(self, item):
+        def safe_date(d_str):
+            if not d_str or '0001-01-01' in str(d_str):
+                return datetime.date(9999, 12, 31)
+            try:
+                return datetime.datetime.fromisoformat(str(d_str)).date()
+            except Exception:
+                return datetime.date(9999, 12, 31)
+
+        delivery_date = safe_date(item.get('ksdeliverydate'))
+        landing_date = safe_date(item.get('kslandingdate'))
+        primary_date = delivery_date if delivery_date != datetime.date(9999, 12, 31) else landing_date
+        return (primary_date, str(item.get('documentNo', '')))
+
+    def sort_po_column(self, col_id):
+        last_col, last_rev = self._sort_state["po"]
+        reverse = (last_col == col_id and not last_rev)
+
+        def key_func(item):
+            if col_id == 'deliveryOrEta':
+                return self._get_default_sort_key(item)
+            elif col_id == 'quantity':
+                return item.get('quantity', 0)
+            val = item.get(col_id)
+            return str(val).lower() if val is not None else ""
+
+        self.filtered_po_data.sort(key=key_func, reverse=reverse)
+        self._sort_state["po"] = (col_id, reverse)
+
+        for c in self.po_columns.keys():
+            txt = self.po_columns[c][0]
+            if c == col_id:
+                txt += " ▼" if reverse else " ▲"
+            self.po_tree.heading(c, text=txt)
+
+        self.populate_po_tree()
+
+    def sort_oos_column(self, col_id):
+        last_col, last_rev = self._sort_state["oos"]
+        reverse = (last_col == col_id and not last_rev)
+
+        def key_func(item):
+            if col_id in ['soh', 'quantity']:
+                return item.get(col_id, 0)
+            val = item.get(col_id)
+            return str(val).lower() if val is not None else ""
+
+        self.filtered_oos_data.sort(key=key_func, reverse=reverse)
+        self._sort_state["oos"] = (col_id, reverse)
+
+        for c in self.oos_columns.keys():
+            txt = self.oos_columns[c][0]
+            if c == col_id:
+                txt += " ▼" if reverse else " ▲"
+            self.oos_tree.heading(c, text=txt)
+
+        self.populate_oos_tree()
+
+    def _refresh_segmented_styles(self, segmented_widget):
+        """Applies bold white to the selected segment and regular muted slate to unselected segments."""
+        current_val = segmented_widget.get()
+        for val, btn in segmented_widget._buttons_dict.items():
+            if val == current_val:
+                btn.configure(
+                    font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                    text_color="#FFFFFF"
+                )
+            else:
+                btn.configure(
+                    font=ctk.CTkFont(family="Segoe UI", size=12, weight="normal"),
+                    text_color="#64748B"  # Soft readable slate
+                )
+
+    def _on_oos_segment_changed(self):
+        self._refresh_segmented_styles(self.oos_filter_segmented)
+        self.apply_oos_filters()
+
+    # ---------------- Navigation & Detail View ----------------
+    def show_po_summary_view(self):
+        self.active_tab = "po"
+        self.detail_frame.grid_forget()
+        self.oos_items_frame.grid_forget()
+        self.po_summary_frame.grid(row=0, column=0, sticky="nsew")
+        self.row_count_label.configure(text=f"Showing {len(self.filtered_po_data)} of {len(self.all_summary_data)} Purchase Orders")
+
+    def show_oos_items_view(self):
+        self.active_tab = "oos"
+        self.detail_frame.grid_forget()
+        self.po_summary_frame.grid_forget()
+        self.oos_items_frame.grid(row=0, column=0, sticky="nsew")
+        self.row_count_label.configure(text=f"Showing {len(self.filtered_oos_data)} of {len(self.all_oos_items)} Critical Inbound Items")
+
+    def show_selected_detail_view(self):
+        if self.active_tab == "po":
+            selected = self.po_tree.selection()
+            if not selected:
+                messagebox.showwarning("Selection Required", "Please select a purchase order row.", parent=self)
+                return
+            index = int(selected[0])
+            self.show_detail_view(self.filtered_po_data[index])
+        else:
+            selected = self.oos_tree.selection()
+            if not selected:
+                messagebox.showwarning("Selection Required", "Please select an item row.", parent=self)
+                return
+            index = int(selected[0])
+            parent_po = self.filtered_oos_data[index].get('_parent_po')
+            self.show_detail_view(parent_po)
+
+    def show_detail_view(self, po_object):
+        if not po_object:
+            return
+        self.current_detail_object = po_object
+
+        self.po_summary_frame.grid_forget()
+        self.oos_items_frame.grid_forget()
+        self.detail_frame.grid(row=0, column=0, sticky="nsew")
+
+        po_num = po_object.get('documentNo', 'PO')
+        brand = po_object.get('brand', '')
+        line_items = po_object.get('line_items', [])
+
+        self.title(f"Purchase Order Lines: {po_num} — {brand}")
+        self.detail_title_label.configure(text=f"PO: {po_num}  |  Brand: {brand}")
+
+        for item in self.detail_tree.get_children():
+            self.detail_tree.delete(item)
+
+        total_lines_qty = 0
+        for line in sorted(line_items, key=lambda x: str(x.get('Productcode', ''))):
+            qty = line.get('quantity', 0)
+            soh = line.get('soh', 0)
+            total_lines_qty += qty
+            tag = 'oos_zero' if soh <= 0 else ('low_stock' if soh < 50 else '')
+
+            values = (
+                line.get('Productcode', ''),
+                line.get('description', ''),
+                f"{soh:,}",
+                f"{qty:,}"
+            )
+            self.detail_tree.insert('', 'end', values=values, tags=(tag,) if tag else ())
+
+        self.detail_footer_lbl.configure(
+            text=f"Total Unique SKUs: {len(line_items)}  |  Total Order Quantity: {total_lines_qty:,}"
+        )
+
+    def toggle_components_visibility(self):
+        self.show_components = not self.show_components
+
+        if self.show_components:
+            self.btn_components_toggle.configure(
+                text="Components: Visible",
+                fg_color="#27AE60",
+                hover_color="#1E8449",
+                text_color="#FFFFFF"
+            )
+        else:
+            # High-contrast readable inactive state
+            self.btn_components_toggle.configure(
+                text="Components: Hidden",
+                fg_color="#EE2525",
+                hover_color="#CF0E0E",
+                text_color="#FFFFFF"
+            )
+
+        self.apply_oos_filters()
+
+    def _on_back_pressed(self):
+        if self.active_tab == "oos":
+            self.show_oos_items_view()
+        else:
+            self.show_po_summary_view()
+
+    # ---------------- Export to CSV ----------------
+    def export_to_csv(self):
+        if self.detail_frame.winfo_ismapped() and self.current_detail_object:
+            po = self.current_detail_object.get("documentNo", "PO")
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                initialfile=f"PO_{po}_lines.csv",
+                filetypes=[("CSV File", "*.csv")]
+            )
+            if not file_path:
+                return
+
+            with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["PO Number", "SKU", "Description", "Stock On Hand", "Ordered Quantity"])
+                for item in self.current_detail_object.get("line_items", []):
+                    writer.writerow([
+                        po, item.get("Productcode", ""), item.get("description", ""),
+                        item.get("soh", 0), item.get("quantity", 0)
+                    ])
+            messagebox.showinfo("Export Complete", f"Saved details to:\n{file_path}", parent=self)
+
+        elif self.active_tab == "oos":
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                initialfile="Critical_Inbound_OOS_Items.csv",
+                filetypes=[("CSV File", "*.csv")]
+            )
+            if not file_path:
+                return
+
+            with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["SKU", "Description", "Brand", "Current SOH", "Incoming Qty", "PO Number", "Delivery/ETA", "Status"])
+                for item in self.filtered_oos_data:
+                    writer.writerow([
+                        item.get("Productcode", ""), item.get("description", ""), item.get("brand", ""),
+                        item.get("soh", 0), item.get("quantity", 0), item.get("documentNo", ""),
+                        item.get("deliveryOrEta", ""), item.get("stock_status", "")
+                    ])
+            messagebox.showinfo("Export Complete", f"Saved OOS list to:\n{file_path}", parent=self)
+
+        else:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                initialfile="Open_Purchase_Orders_Summary.csv",
+                filetypes=[("CSV File", "*.csv")]
+            )
+            if not file_path:
+                return
+
+            with open(file_path, mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["PO Number", "Brand", "Total Quantity", "Shipment Type", "Delivery Date", "Landing ETA"])
+                for s in self.filtered_po_data:
+                    writer.writerow([
+                        s.get("documentNo", ""), s.get("brand", ""), s.get("quantity", 0),
+                        s.get("ksshipmenttype", ""), self._format_date(s.get("ksdeliverydate")),
+                        self._format_date(s.get("kslandingdate"))
+                    ])
+            messagebox.showinfo("Export Complete", f"Saved summary to:\n{file_path}", parent=self)
+
+    def _on_escape(self, event=None):
+        if self.detail_frame.winfo_ismapped():
+            self._on_back_pressed()
+        else:
+            self.destroy()
+
+
+# =====================================================================
+# Entrypoint
+# =====================================================================
+if __name__ == "__main__":
+    app = PurchaseOrdersApp()
+    app.mainloop()
